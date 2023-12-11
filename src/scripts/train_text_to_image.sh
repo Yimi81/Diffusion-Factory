@@ -1,0 +1,18 @@
+CUDA_VISIBLE_DEVICES=0  accelerate launch --mixed_precision="fp16" --num_processes 1 src/train_bash.py \
+    --model_name_or_path runwayml/stable-diffusion-v1-5 \
+    --dataset_name="lambdalabs/pokemon-blip-captions" \
+    --finetuning_type full \
+    --dataloader_num_workers 8\
+    --output_dir sd-pokemon-model \
+    --resolution 512  --center_crop --random_flip \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 4 \
+    --gradient_checkpointing \
+    --lr_scheduler_type cosine \
+    --logging_steps 10 \
+    --save_steps 500 \
+    --learning_rate 5e-5 \
+    --num_train_epochs 3.0 \
+    --report_to wandb \
+    --mixed_precision fp16\
+    --use_ema
