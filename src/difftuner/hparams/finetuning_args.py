@@ -26,7 +26,7 @@ class FinetuningArguments(LoraArguments):
     r"""
     Arguments pertaining to which techniques we are going to fine-tuning with.
     """
-    finetuning_type: Optional[Literal["full", "lora", "dreambooth", "controlnet"]] = field(
+    finetuning_type: Optional[Literal["full", "lora", "dreambooth", "controlnet", "sdxl-full", "sdxl-lora", "sdxl-dreambooth-lora", "sdxl-controlnet"]] = field(
         default="lora",
         metadata={"help": "Which fine-tuning method to use."}
     )

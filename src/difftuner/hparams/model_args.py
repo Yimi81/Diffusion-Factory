@@ -7,12 +7,16 @@ class ModelArguments:
     r"""
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune.
     """
-    model_name_or_path: str = field(
+    pretrained_model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."}
     )
     controlnet_model_name_or_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to pretrained controlnet model or model identifier from huggingface.co/models. If not specified controlnet weights are initialized from unet."}
+    )
+    pretrained_vae_model_name_or_path: str = field(
+        default=None,
+        metadata={"help": "Path to pretrained VAE model with better numerical stability. More details: https://github.com/huggingface/diffusers/pull/4038."}
     )
     cache_dir: Optional[str] = field(
         default=None,
@@ -34,6 +38,10 @@ class ModelArguments:
     enable_xformers_memory_efficient_attention: Optional[bool] = field(
         default=True,
         metadata={"help": "Whether or not to use xformers."}
+    )
+    is_sdxl: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Is it an sdxl model."}
     )
 
 

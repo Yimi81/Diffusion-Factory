@@ -705,13 +705,13 @@ class CustomDreamBoothTrainer:
 
         if is_test:
             pipeline = DiffusionPipeline.from_pretrained(
-                self.model_args.model_name_or_path, revision=self.model_args.revision, variant=self.model_args.variant, torch_dtype=weight_dtype
+                self.model_args.pretrained_model_name_or_path, revision=self.model_args.revision, variant=self.model_args.variant, torch_dtype=weight_dtype
             )
             # load attention processors
             pipeline.unet.load_attn_procs(self.training_args.output_dir)
         else:
             pipeline = DiffusionPipeline.from_pretrained(
-                self.model_args.model_name_or_path,
+                self.model_args.pretrained_model_name_or_path,
                 unet=self.accelerator.unwrap_model(self.unet),
                 revision=self.model_args.revision,
                 variant=self.model_args.variant,

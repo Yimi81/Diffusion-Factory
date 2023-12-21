@@ -80,7 +80,7 @@ class CustomFullTrainer:
         # Create EMA for the unet.
         if training_args.use_ema:
             ema_unet = UNet2DConditionModel.from_pretrained(
-                model_args.model_name_or_path, subfolder="unet", revision=model_args.revision
+                model_args.pretrained_model_name_or_path, subfolder="unet", revision=model_args.revision
             )
             ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
 
@@ -391,7 +391,7 @@ class CustomFullTrainer:
                 ema_unet.copy_to(unet.parameters())
             
             pipeline = StableDiffusionPipeline.from_pretrained(
-                model_args.model_name_or_path,
+                model_args.pretrained_model_name_or_path,
                 text_encoder=text_encoder,
                 vae=vae,
                 unet=unet,
@@ -418,7 +418,7 @@ class CustomFullTrainer:
             )
         else:
             pipeline = StableDiffusionPipeline.from_pretrained(
-                self.model_args.model_name_or_path,
+                self.model_args.pretrained_model_name_or_path,
                 vae=self.accelerator.unwrap_model(self.vae),
                 text_encoder=self.accelerator.unwrap_model(self.text_encoder),
                 tokenizer=self.tokenizer,

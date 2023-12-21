@@ -415,7 +415,7 @@ class CustomControlNetTrainer:
             logger.info("Loading existing controlnet weights")
             controlnet = ControlNetModel.from_pretrained(self.training_args.output_dir)
             pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-                self.model_args.model_name_or_path,
+                self.model_args.pretrained_model_name_or_path,
                 controlnet = controlnet,
                 safety_checker=None,
                 revision=self.model_args.revision,
@@ -424,7 +424,7 @@ class CustomControlNetTrainer:
             )
         else:
             pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-                self.model_args.model_name_or_path,
+                self.model_args.pretrained_model_name_or_path,
                 vae=self.accelerator.unwrap_model(self.vae),
                 text_encoder=self.accelerator.unwrap_model(self.text_encoder),
                 tokenizer=self.tokenizer,
