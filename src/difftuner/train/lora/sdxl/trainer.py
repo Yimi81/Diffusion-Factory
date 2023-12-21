@@ -539,7 +539,7 @@ class SDXLCustomLoraTrainer:
         else:
             # create pipeline
             pipeline = StableDiffusionXLPipeline.from_pretrained(
-                self.training_args.pretrained_model_name_or_path,
+                self.model_args.pretrained_model_name_or_path,
                 vae=self.vae,
                 text_encoder=self.accelerator.unwrap_model(self.text_encoder_one),
                 text_encoder_2=self.accelerator.unwrap_model(self.text_encoder_two),
