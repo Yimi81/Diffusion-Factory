@@ -93,7 +93,7 @@ class SDXLCustomLoraTrainer:
             vae.to(accelerator.device, dtype=weight_dtype)
         text_encoder_one.to(accelerator.device, dtype=weight_dtype)
         text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-
+        
         # now we will add new LoRA weights to the attention layers
         # Set correct lora layers
         unet_lora_config = LoraConfig(
@@ -324,6 +324,8 @@ class SDXLCustomLoraTrainer:
                     # Convert images to latent space
                     latents = vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * vae.config.scaling_factor
+                    if model_args.pretrained_vae_model_name_or_path is None:
+                        latents = latents.to(weight_dtype)
 
                     # Sample noise that we'll add to the latents
                     noise = torch.randn_like(latents)

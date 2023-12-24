@@ -63,5 +63,5 @@ def get_dataset(
     
     if max_samples is not None: # truncate dataset
         dataset = dataset.select(range(min(len(dataset), max_samples)))
-        
+
     return dataset
