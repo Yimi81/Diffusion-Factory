@@ -1,4 +1,5 @@
 import os
+import gc
 import itertools
 import math
 from typing import TYPE_CHECKING, Optional, List
@@ -13,12 +14,15 @@ import shutil
 from packaging import version
 from tqdm.auto import tqdm
 
+from huggingface_hub.utils import insecure_hashlib
+
 from transformers import PreTrainedTokenizer, CLIPTextModel, CLIPTokenizer, AutoTokenizer
 from torchvision import transforms
 
 from difftuner.data import get_dataset, preprocess_dataset, collate_fn
 from difftuner.model import load_scheduler_and_model_and_tokenizer
 from difftuner.extras.logging import get_logger
+from difftuner.train.utils import import_model_class_from_model_name_or_path
 
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, ControlNetModel, DiffusionPipeline
 from diffusers.optimization import get_scheduler
@@ -37,6 +41,7 @@ from diffusers.training_utils import unet_lora_state_dict
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 
+
 import accelerate
 from accelerate import Accelerator
 
@@ -49,169 +54,6 @@ if is_wandb_available():
 
 logger = get_logger(__name__)
 
-
-# TODO: This function should be removed once training scripts are rewritten in PEFT
-def text_encoder_lora_state_dict(text_encoder):
-    state_dict = {}
-
-    def text_encoder_attn_modules(text_encoder):
-        from transformers import CLIPTextModel, CLIPTextModelWithProjection
-
-        attn_modules = []
-
-        if isinstance(text_encoder, (CLIPTextModel, CLIPTextModelWithProjection)):
-            for i, layer in enumerate(text_encoder.text_model.encoder.layers):
-                name = f"text_model.encoder.layers.{i}.self_attn"
-                mod = layer.self_attn
-                attn_modules.append((name, mod))
-
-        return attn_modules
-
-    for name, module in text_encoder_attn_modules(text_encoder):
-        for k, v in module.q_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.q_proj.lora_linear_layer.{k}"] = v
-
-        for k, v in module.k_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.k_proj.lora_linear_layer.{k}"] = v
-
-        for k, v in module.v_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.v_proj.lora_linear_layer.{k}"] = v
-
-        for k, v in module.out_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.out_proj.lora_linear_layer.{k}"] = v
-
-    return state_dict
-
-class DreamBoothDataset(Dataset):
-    """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images and the tokenizes prompts.
-    """
-
-    def __init__(
-        self,
-        instance_data_root,
-        instance_prompt,
-        tokenizer,
-        class_data_root=None,
-        class_prompt=None,
-        class_num=None,
-        size=512,
-        center_crop=False,
-        encoder_hidden_states=None,
-        class_prompt_encoder_hidden_states=None,
-        tokenizer_max_length=None,
-    ):
-        self.size = size
-        self.center_crop = center_crop
-        self.tokenizer = tokenizer
-        self.encoder_hidden_states = encoder_hidden_states
-        self.class_prompt_encoder_hidden_states = class_prompt_encoder_hidden_states
-        self.tokenizer_max_length = tokenizer_max_length
-
-        self.instance_data_root = Path(instance_data_root)
-        if not self.instance_data_root.exists():
-            raise ValueError("Instance images root doesn't exists.")
-
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
-        self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            if class_num is not None:
-                self.num_class_images = min(len(self.class_images_path), class_num)
-            else:
-                self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-            self.class_prompt = class_prompt
-        else:
-            self.class_data_root = None
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-
-    def __len__(self):
-        return self._length
-
-    def __getitem__(self, index):
-        example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        instance_image = exif_transpose(instance_image)
-
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
-        example["instance_images"] = self.image_transforms(instance_image)
-
-        if self.encoder_hidden_states is not None:
-            example["instance_prompt_ids"] = self.encoder_hidden_states
-        else:
-            text_inputs = tokenize_prompt(
-                self.tokenizer, self.instance_prompt, tokenizer_max_length=self.tokenizer_max_length
-            )
-            example["instance_prompt_ids"] = text_inputs.input_ids
-            example["instance_attention_mask"] = text_inputs.attention_mask
-
-        if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-
-            if self.class_prompt_encoder_hidden_states is not None:
-                example["class_prompt_ids"] = self.class_prompt_encoder_hidden_states
-            else:
-                class_text_inputs = tokenize_prompt(
-                    self.tokenizer, self.class_prompt, tokenizer_max_length=self.tokenizer_max_length
-                )
-                example["class_prompt_ids"] = class_text_inputs.input_ids
-                example["class_attention_mask"] = class_text_inputs.attention_mask
-
-        return example
-
-
-def collate_fn(examples, with_prior_preservation=False):
-    has_attention_mask = "instance_attention_mask" in examples[0]
-
-    input_ids = [example["instance_prompt_ids"] for example in examples]
-    pixel_values = [example["instance_images"] for example in examples]
-
-    if has_attention_mask:
-        attention_mask = [example["instance_attention_mask"] for example in examples]
-
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
-    if with_prior_preservation:
-        input_ids += [example["class_prompt_ids"] for example in examples]
-        pixel_values += [example["class_images"] for example in examples]
-        if has_attention_mask:
-            attention_mask += [example["class_attention_mask"] for example in examples]
-
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    input_ids = torch.cat(input_ids, dim=0)
-
-    batch = {
-        "input_ids": input_ids,
-        "pixel_values": pixel_values,
-    }
-
-    if has_attention_mask:
-        batch["attention_mask"] = attention_mask
-
-    return batch
 
 class PromptDataset(Dataset):
     "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
@@ -229,53 +71,22 @@ class PromptDataset(Dataset):
         example["index"] = index
         return example
 
-def tokenize_prompt(tokenizer, prompt, tokenizer_max_length=None):
-    if tokenizer_max_length is not None:
-        max_length = tokenizer_max_length
-    else:
-        max_length = tokenizer.model_max_length
-
-    text_inputs = tokenizer(
-        prompt,
-        truncation=True,
-        padding="max_length",
-        max_length=max_length,
-        return_tensors="pt",
-    )
-
-    return text_inputs
-
-
-def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_attention_mask=None):
-    text_input_ids = input_ids.to(text_encoder.device)
-
-    if text_encoder_use_attention_mask:
-        attention_mask = attention_mask.to(text_encoder.device)
-    else:
-        attention_mask = None
-
-    prompt_embeds = text_encoder(
-        text_input_ids,
-        attention_mask=attention_mask,
-    )
-    prompt_embeds = prompt_embeds[0]
-
-    return prompt_embeds
-
 
 class CustomDreamBoothTrainer:
     def __init__(self, 
-                 model_args: ModelArguments = None, 
-                 training_args: DiffusionTrainingArguemnts = None, 
-                 finetuning_args: FinetuningArguments = None, 
-                 train_dataloader: DataLoader = None, 
-                 tokenizer: PreTrainedTokenizer = None,
-                 accelerator: Accelerator = None, 
-                 noise_scheduler: DDPMScheduler = None, 
-                 unet: UNet2DConditionModel = None, 
-                 controlnet: ControlNetModel = None, 
-                 vae: AutoencoderKL = None, 
-                 text_encoder: CLIPTextModel = None):
+                 data_args: DataArguments, 
+                 model_args: ModelArguments, 
+                 training_args: DiffusionTrainingArguemnts, 
+                 finetuning_args: FinetuningArguments, 
+                 train_dataloader: DataLoader, 
+                 tokenizer: PreTrainedTokenizer,
+                 accelerator: Accelerator, 
+                 noise_scheduler: DDPMScheduler, 
+                 unet: UNet2DConditionModel, 
+                 controlnet: ControlNetModel, 
+                 vae: AutoencoderKL, 
+                 text_encoder: CLIPTextModel):
+        self.data_args = data_args
         self.model_args = model_args
         self.training_args = training_args
         self.finetuning_args = finetuning_args
@@ -291,6 +102,7 @@ class CustomDreamBoothTrainer:
         self.text_encoder = text_encoder
 
     def train(self):
+        data_args = self.data_args
         model_args = self.model_args
         training_args = self.training_args
         finetuning_args = self.finetuning_args
@@ -302,131 +114,109 @@ class CustomDreamBoothTrainer:
         vae = self.vae
         text_encoder = self.text_encoder
 
-        # now we will add new LoRA weights to the attention layers
-        # It's important to realize here how many attention weights will be added and of which sizes
-        # The sizes of the attention layers consist only of two different variables:
-        # 1) - the "hidden_size", which is increased according to `unet.config.block_out_channels`.
-        # 2) - the "cross attention size", which is set to `unet.config.cross_attention_dim`.
-
-        # Let's first see how many attention processors we will have to set.
-        # For Stable Diffusion, it should be equal to:
-        # - down blocks (2x attention layers) * (2x transformer layers) * (3x down blocks) = 12
-        # - mid blocks (2x attention layers) * (1x transformer layers) * (1x mid blocks) = 2
-        # - up blocks (2x attention layers) * (3x transformer layers) * (3x down blocks) = 18
-        # => 32 layers
-        # Set correct lora layers
-        unet_lora_parameters = []
-        for attn_processor_name, attn_processor in unet.attn_processors.items():
-            # Parse the attention module.
-            attn_module = unet
-            for n in attn_processor_name.split(".")[:-1]:
-                attn_module = getattr(attn_module, n)
-
-            # Set the `lora_layer` attribute of the attention-related matrices.
-            attn_module.to_q.set_lora_layer(
-                LoRALinearLayer(
-                    in_features=attn_module.to_q.in_features, out_features=attn_module.to_q.out_features, rank=finetuning_args.lora_rank
-                )
-            )
-            attn_module.to_k.set_lora_layer(
-                LoRALinearLayer(
-                    in_features=attn_module.to_k.in_features, out_features=attn_module.to_k.out_features, rank=finetuning_args.lora_rank
-                )
+        # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
+        # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
+        # TODO (patil-suraj): Remove this check when gradient accumulation with two models is enabled in accelerate.
+        if training_args.train_text_encoder and training_args.gradient_accumulation_steps > 1 and accelerator.num_processes > 1:
+            raise ValueError(
+                "Gradient accumulation is not supported when training the text encoder in distributed training. "
+                "Please set gradient_accumulation_steps to 1. This feature will be supported in the future."
             )
 
-            attn_module.to_v.set_lora_layer(
-                LoRALinearLayer(
-                    in_features=attn_module.to_v.in_features, out_features=attn_module.to_v.out_features, rank=finetuning_args.lora_rank
+        # Generate class images if prior preservation is enabled.
+        if training_args.with_prior_preservation:
+            class_images_dir = Path(data_args.dreambooth_class_data_dir)
+            if not class_images_dir.exists():
+                class_images_dir.mkdir(parents=True)
+            cur_class_images = len(list(class_images_dir.iterdir()))
+
+            if cur_class_images < training_args.num_class_images:
+                torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+                if training_args.prior_generation_precision == "fp32":
+                    torch_dtype = torch.float32
+                elif training_args.prior_generation_precision == "fp16":
+                    torch_dtype = torch.float16
+                elif training_args.prior_generation_precision == "bf16":
+                    torch_dtype = torch.bfloat16
+                pipeline = DiffusionPipeline.from_pretrained(
+                    model_args.pretrained_model_name_or_path,
+                    torch_dtype=torch_dtype,
+                    safety_checker=None,
+                    revision=model_args.revision,
+                    variant=model_args.variant,
                 )
+                pipeline.set_progress_bar_config(disable=True)
+
+                num_new_images = training_args.num_class_images - cur_class_images
+                logger.info(f"Number of class images to sample: {num_new_images}.")
+
+                sample_dataset = PromptDataset(training_args.class_prompt, num_new_images)
+                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=training_args.sample_batch_size)
+
+                sample_dataloader = accelerator.prepare(sample_dataloader)
+                pipeline.to(accelerator.device)
+
+                for example in tqdm(
+                    sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                ):
+                    images = pipeline(example["prompt"]).images
+
+                    for i, image in enumerate(images):
+                        hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
+                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        image.save(image_filename)
+
+                del pipeline
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        def save_model_hook(models, weights, output_dir):
+            if accelerator.is_main_process:
+                for model in models:
+                    sub_dir = "unet" if isinstance(model, type(accelerator.unwrap_model(unet))) else "text_encoder"
+                    model.save_pretrained(os.path.join(output_dir, sub_dir))
+
+                    # make sure to pop weight so that corresponding model is not saved again
+                    weights.pop()
+
+        def load_model_hook(models, input_dir):
+            while len(models) > 0:
+                # pop models so that they are not loaded again
+                model = models.pop()
+
+                if isinstance(model, type(accelerator.unwrap_model(text_encoder))):
+                    # load transformers style into model
+                    text_encoder_cls = import_model_class_from_model_name_or_path(model_args.pretrained_model_name_or_path, model_args.revision)
+                    load_model = text_encoder_cls.from_pretrained(input_dir, subfolder="text_encoder")
+                    model.config = load_model.config
+                else:
+                    # load diffusers style into model
+                    load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                    model.register_to_config(**load_model.config)
+
+                model.load_state_dict(load_model.state_dict())
+                del load_model
+
+        accelerator.register_save_state_pre_hook(save_model_hook)
+        accelerator.register_load_state_pre_hook(load_model_hook)
+
+        # Check that all trainable models are in full precision
+        low_precision_error_string = (
+            "Please make sure to always have all model weights in full float32 precision when starting training - even if"
+            " doing mixed precision training. copy of the weights should still be float32."
+        )
+
+        if accelerator.unwrap_model(unet).dtype != torch.float32:
+            raise ValueError(
+                f"Unet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
             )
-            attn_module.to_out[0].set_lora_layer(
-                LoRALinearLayer(
-                    in_features=attn_module.to_out[0].in_features,
-                    out_features=attn_module.to_out[0].out_features,
-                    rank=finetuning_args.lora_rank,
-                )
+
+        if training_args.train_text_encoder and accelerator.unwrap_model(text_encoder).dtype != torch.float32:
+            raise ValueError(
+                f"Text encoder loaded as datatype {accelerator.unwrap_model(text_encoder).dtype}."
+                f" {low_precision_error_string}"
             )
-
-            # Accumulate the LoRA params to optimize.
-            unet_lora_parameters.extend(attn_module.to_q.lora_layer.parameters())
-            unet_lora_parameters.extend(attn_module.to_k.lora_layer.parameters())
-            unet_lora_parameters.extend(attn_module.to_v.lora_layer.parameters())
-            unet_lora_parameters.extend(attn_module.to_out[0].lora_layer.parameters())
-
-            if isinstance(attn_processor, (AttnAddedKVProcessor, SlicedAttnAddedKVProcessor, AttnAddedKVProcessor2_0)):
-                attn_module.add_k_proj.set_lora_layer(
-                    LoRALinearLayer(
-                        in_features=attn_module.add_k_proj.in_features,
-                        out_features=attn_module.add_k_proj.out_features,
-                        rank=finetuning_args.rank,
-                    )
-                )
-                attn_module.add_v_proj.set_lora_layer(
-                    LoRALinearLayer(
-                        in_features=attn_module.add_v_proj.in_features,
-                        out_features=attn_module.add_v_proj.out_features,
-                        rank=finetuning_args.rank,
-                    )
-                )
-                unet_lora_parameters.extend(attn_module.add_k_proj.lora_layer.parameters())
-                unet_lora_parameters.extend(attn_module.add_v_proj.lora_layer.parameters())
-        
-        
-        # The text encoder comes from 🤗 transformers, so we cannot directly modify it.
-        # So, instead, we monkey-patch the forward calls of its attention-blocks.
-        if training_args.train_text_encoder:
-            # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
-            text_lora_parameters = LoraLoaderMixin._modify_text_encoder(text_encoder, dtype=torch.float32, rank=finetuning_args.rank)
-
-        # `accelerate` 0.16.0 will have better support for customized saving
-        if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-            # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-            def save_model_hook(models, weights, output_dir):
-                if accelerator.is_main_process:
-                    # there are only two options here. Either are just the unet attn processor layers
-                    # or there are the unet and text encoder atten layers
-                    unet_lora_layers_to_save = None
-                    text_encoder_lora_layers_to_save = None
-
-                    for model in models:
-                        if isinstance(model, type(accelerator.unwrap_model(unet))):
-                            unet_lora_layers_to_save = unet_lora_state_dict(model)
-                        elif isinstance(model, type(accelerator.unwrap_model(text_encoder))):
-                            text_encoder_lora_layers_to_save = text_encoder_lora_state_dict(model)
-                        else:
-                            raise ValueError(f"unexpected save model: {model.__class__}")
-
-                        # make sure to pop weight so that corresponding model is not saved again
-                        weights.pop()
-
-                    LoraLoaderMixin.save_lora_weights(
-                        output_dir,
-                        unet_lora_layers=unet_lora_layers_to_save,
-                        text_encoder_lora_layers=text_encoder_lora_layers_to_save,
-                    )
-
-            def load_model_hook(models, input_dir):
-                unet_ = None
-                text_encoder_ = None
-
-                while len(models) > 0:
-                    model = models.pop()
-
-                    if isinstance(model, type(accelerator.unwrap_model(unet))):
-                        unet_ = model
-                    elif isinstance(model, type(accelerator.unwrap_model(text_encoder))):
-                        text_encoder_ = model
-                    else:
-                        raise ValueError(f"unexpected save model: {model.__class__}")
-
-                lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
-                LoraLoaderMixin.load_lora_into_unet(lora_state_dict, network_alphas=network_alphas, unet=unet_)
-                LoraLoaderMixin.load_lora_into_text_encoder(
-                    lora_state_dict, network_alphas=network_alphas, text_encoder=text_encoder_
-                )
-
-            accelerator.register_save_state_pre_hook(save_model_hook)
-            accelerator.register_load_state_pre_hook(load_model_hook)
 
         # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
         # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -436,10 +226,12 @@ class CustomDreamBoothTrainer:
         elif accelerator.mixed_precision == "bf16":
             weight_dtype = torch.bfloat16
         
-        # Move unet, vae and text_encoder to device and cast to weight_dtype
-        unet.to(accelerator.device, dtype=weight_dtype)
-        vae.to(accelerator.device, dtype=weight_dtype)
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
+        # Move vae and text_encoder to device and cast to weight_dtype
+        if vae is not None:
+            vae.to(accelerator.device, dtype=weight_dtype)
+
+        if not training_args.train_text_encoder and text_encoder is not None:
+            text_encoder.to(accelerator.device, dtype=weight_dtype)
 
         if training_args.scale_lr:
             training_args.learning_rate = (
@@ -459,11 +251,8 @@ class CustomDreamBoothTrainer:
         else:
             optimizer_cls = torch.optim.AdamW
 
-        # Optimizer creation
         params_to_optimize = (
-            itertools.chain(unet_lora_parameters, text_lora_parameters)
-            if training_args.train_text_encoder
-            else unet_lora_parameters
+            itertools.chain(unet.parameters(), text_encoder.parameters()) if training_args.train_text_encoder else unet.parameters()
         )
 
         # init optimizer
@@ -491,9 +280,14 @@ class CustomDreamBoothTrainer:
         )
 
         # Prepare everything with our `accelerator`.
-        unet_lora_parameters, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet_lora_parameters, optimizer, train_dataloader, lr_scheduler
-        )
+        if training_args.train_text_encoder:
+            unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+            )
+        else:
+            unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                unet, optimizer, train_dataloader, lr_scheduler
+            )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / training_args.gradient_accumulation_steps)
@@ -558,6 +352,9 @@ class CustomDreamBoothTrainer:
         )
 
         for epoch in range(first_epoch, training_args.num_train_epochs):
+            unet.train()
+            if training_args.train_text_encoder:
+                text_encoder.train()
             train_loss = 0.0
             for step, batch in enumerate(train_dataloader):
                 with accelerator.accumulate(unet):
@@ -574,7 +371,9 @@ class CustomDreamBoothTrainer:
                         )
                     if training_args.input_perturbation:
                         new_noise = noise + training_args.input_perturbation * torch.randn_like(noise)
-                    bsz = latents.shape[0]
+
+                    bsz, channels, height, width = latents.shape
+
                     # Sample a random timestep for each image
                     timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                     timesteps = timesteps.long()
@@ -587,7 +386,39 @@ class CustomDreamBoothTrainer:
                         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                     # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    if training_args.pre_compute_text_embeddings:
+                        encoder_hidden_states = batch["input_ids"]
+                    else:
+                        def encode_prompt(text_encoder, input_ids, attention_mask, text_encoder_use_attention_mask=None):
+                            text_input_ids = input_ids.to(text_encoder.device)
+
+                            if text_encoder_use_attention_mask:
+                                attention_mask = attention_mask.to(text_encoder.device)
+                            else:
+                                attention_mask = None
+
+                            prompt_embeds = text_encoder(
+                                text_input_ids,
+                                attention_mask=attention_mask,
+                            )
+                            prompt_embeds = prompt_embeds[0]
+
+                            return prompt_embeds
+                        
+                        encoder_hidden_states = encode_prompt(
+                            text_encoder,
+                            batch["input_ids"],
+                            batch["attention_mask"],
+                            text_encoder_use_attention_mask=training_args.text_encoder_use_attention_mask,
+                        )
+
+                    if accelerator.unwrap_model(unet).config.in_channels == channels * 2:
+                        noisy_latents = torch.cat([noisy_latents, noisy_latents], dim=1)
+
+                    if training_args.class_labels_conditioning == "timesteps":
+                        class_labels = timesteps
+                    else:
+                        class_labels = None
 
                     # Get the target for loss depending on the prediction type
                     if training_args.prediction_type is not None:
@@ -602,9 +433,19 @@ class CustomDreamBoothTrainer:
                         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
                     # Predict the noise residual and compute loss
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, class_labels=class_labels).sample
 
-                    
+                    if model_pred.shape[1] == 6:
+                        model_pred, _ = torch.chunk(model_pred, 2, dim=1)
+
+                    if training_args.with_prior_preservation:
+                        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                        model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                        target, target_prior = torch.chunk(target, 2, dim=0)
+
+                        # Compute prior loss
+                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")  
+
                     if training_args.snr_gamma is None:
                         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                     else:
@@ -627,10 +468,18 @@ class CustomDreamBoothTrainer:
                     avg_loss = accelerator.gather(loss.repeat(training_args.per_device_train_batch_size )).mean()
                     train_loss += avg_loss.item() / training_args.gradient_accumulation_steps
 
+                    if training_args.with_prior_preservation:
+                        # Add the prior loss to the instance loss.
+                        loss = loss + training_args.prior_loss_weight * prior_loss
+
                     # Backpropagate
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
-                        params_to_clip = unet_lora_parameters
+                        params_to_clip = (
+                            itertools.chain(unet.parameters(), text_encoder.parameters())
+                            if training_args.train_text_encoder
+                            else unet.parameters()
+                        )
                         accelerator.clip_grad_norm_(params_to_clip, training_args.max_grad_norm)
                     optimizer.step()
                     lr_scheduler.step()
@@ -687,8 +536,34 @@ class CustomDreamBoothTrainer:
         # Save the lora layers
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            unet = unet.to(torch.float32)
-            unet.save_attn_procs(training_args.output_dir)
+            pipeline_args = {}
+
+            if text_encoder is not None:
+                pipeline_args["text_encoder"] = accelerator.unwrap_model(text_encoder)
+
+
+            pipeline = DiffusionPipeline.from_pretrained(
+                model_args.pretrained_model_name_or_path,
+                unet=accelerator.unwrap_model(unet),
+                revision=model_args.revision,
+                variant=model_args.variant,
+                **pipeline_args,
+            )
+
+            # We train on the simplified learning objective. If we were previously predicting a variance, we need the scheduler to ignore it
+            scheduler_args = {}
+
+            if "variance_type" in pipeline.scheduler.config:
+                variance_type = pipeline.scheduler.config.variance_type
+
+                if variance_type in ["learned", "learned_range"]:
+                    variance_type = "fixed_small"
+
+                scheduler_args["variance_type"] = variance_type
+
+            pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
+
+            pipeline.save_pretrained(training_args.output_dir)
         accelerator.end_training()
         
     def predict(self):
@@ -705,14 +580,16 @@ class CustomDreamBoothTrainer:
 
         if is_test:
             pipeline = DiffusionPipeline.from_pretrained(
-                self.model_args.pretrained_model_name_or_path, revision=self.model_args.revision, variant=self.model_args.variant, torch_dtype=weight_dtype
+                self.training_args.output_dir, revision=self.model_args.revision, variant=self.model_args.variant, torch_dtype=weight_dtype
             )
-            # load attention processors
-            pipeline.unet.load_attn_procs(self.training_args.output_dir)
         else:
+            if self.text_encoder is not None:
+                text_encoder = self.accelerator.unwrap_model(self.text_encoder)
+
             pipeline = DiffusionPipeline.from_pretrained(
                 self.model_args.pretrained_model_name_or_path,
                 unet=self.accelerator.unwrap_model(self.unet),
+                text_encoder=text_encoder,
                 revision=self.model_args.revision,
                 variant=self.model_args.variant,
                 torch_dtype=weight_dtype,

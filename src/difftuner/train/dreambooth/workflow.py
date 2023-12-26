@@ -1,28 +1,13 @@
 import os
-import math
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING
 from pathlib import Path
-import numpy as np
 
 import torch 
-import torch.nn.functional as F
-import shutil
 
-from packaging import version
-from tqdm.auto import tqdm
-
-from diffusers.optimization import get_scheduler
-
-from difftuner.data import get_dataset, preprocess_dataset, collate_fn
+from difftuner.data import get_dataset, preprocess_dataset, dreambooth_collate_fn
 from difftuner.model import load_scheduler_and_model_and_tokenizer
-from difftuner.train.full.trainer import CustomFullTrainer
+from difftuner.train.dreambooth.trainer import CustomDreamBoothTrainer
 
-from diffusers import UNet2DConditionModel, StableDiffusionPipeline
-from diffusers.training_utils import EMAModel, compute_snr
-from diffusers.utils import is_wandb_available
-from diffusers.utils.import_utils import is_xformers_available
-
-import accelerate
 from accelerate import Accelerator
 
 from difftuner.extras.logging import get_logger
@@ -30,11 +15,7 @@ from difftuner.extras.logging import get_logger
 from huggingface_hub import create_repo, upload_folder
 
 if TYPE_CHECKING:
-    from transformers import TrainerCallback
     from difftuner.hparams import ModelArguments, DataArguments, DiffusionTrainingArguemnts, FinetuningArguments
-
-if is_wandb_available():
-    import wandb
 
 
 logger = get_logger(__name__)
@@ -49,7 +30,7 @@ def run_dreambooth(
 ):
     dataset = get_dataset(model_args, data_args)
     noise_scheduler, unet, _, vae, text_encoder, tokenizer = load_scheduler_and_model_and_tokenizer(model_args, finetuning_args, training_args)
-    dataset = preprocess_dataset(dataset, tokenizer, data_args, training_args)
+    dataset = preprocess_dataset(dataset, tokenizer, data_args, training_args, finetuning_args)
 
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
@@ -64,7 +45,7 @@ def run_dreambooth(
     train_dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=lambda examples: dreambooth_collate_fn(examples, training_args.with_prior_preservation),
         batch_size=training_args.per_device_train_batch_size ,
         num_workers=training_args.dataloader_num_workers
     )
@@ -80,7 +61,8 @@ def run_dreambooth(
             ).repo_id
 
     # Initialize our Trainer
-    trainer = CustomFullTrainer(
+    trainer = CustomDreamBoothTrainer(
+        data_args=data_args,
         model_args=model_args,
         training_args=training_args,
         finetuning_args=finetuning_args,

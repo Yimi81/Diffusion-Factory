@@ -51,3 +51,11 @@ class DataArguments:
         default="text",
         metadata={"help": "The column of the dataset containing a caption or a list of captions."}
     )
+    dreambooth_data_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "A folder containing the training data of instance images."}
+    )
+    dreambooth_class_data_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "A folder containing the training data of class images."}
+    )

@@ -17,11 +17,16 @@ def import_model_class_from_model_name_or_path(
         from transformers import CLIPTextModelWithProjection
 
         return CLIPTextModelWithProjection
+    elif model_class == "T5EncoderModel":
+        from transformers import T5EncoderModel
+
+        return T5EncoderModel
     else:
         raise ValueError(f"{model_class} is not supported.")
     
 
-def tokenize_prompt(tokenizer, prompt):
+def tokenize_prompt(tokenizer, prompt, tokenizer_max_length=None):
+        
     text_inputs = tokenizer(
         prompt,
         padding="max_length",

@@ -14,6 +14,12 @@ class DiffusionTrainingArguemnts(TrainingArguments):
                           " 1.10.and an Nvidia Ampere GPU.  Default to the value of accelerate config of the current system or the"
                           " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config.",
                   "choices": ["no", "fp16", "bf16"]}
+    ),
+    prior_generation_precision: Optional[str] = field(
+        default=None,
+        metadata={"help": "Choose prior generation precision between fp32, fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
+                          " 1.10.and an Nvidia Ampere GPU.  Default to  fp16 if a GPU is available else fp32.",
+                  "choices": ["no", "fp32", "fp16", "bf16"]}
     )
     use_ema: Optional[bool] = field(
         default=False,
@@ -72,6 +78,14 @@ class DiffusionTrainingArguemnts(TrainingArguments):
         default=False,
         metadata={"help": "Whether to train the text encoder. If set, the text encoder should be float32 precision."}
     )
+    pre_compute_text_embeddings: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to pre-compute text embeddings. If text embeddings are pre-computed, the text encoder will not be kept in memory during training and will leave more GPU memory available for training the rest of the model. This is not compatible with `--train_text_encoder`."}
+    )
+    text_encoder_use_attention_mask: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether to use attention mask for the text encoder"}
+    )
     with_prior_preservation: Optional[bool] = field(
         default=False,
         metadata={"help": "Flag to add prior preservation loss."}
@@ -84,7 +98,27 @@ class DiffusionTrainingArguemnts(TrainingArguments):
         default=None,
         metadata={"help": "The prompt with identifier specifying the instance."}
     )
-
+    class_labels_conditioning: Optional[str] = field(
+        default=None,
+        metadata={"help": "The optional `class_label` conditioning to pass to the unet, available values are `timesteps`."}
+    )
+    prior_loss_weight: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "The weight of prior preservation loss."}
+    )
+    num_class_images: Optional[int] = field(
+        default=100,
+        metadata={"help": "Minimal class images for prior preservation loss. If there are not enough images already present in."
+                          " class_data_dir, additional images will be sampled with class_prompt."}
+    ),
+    sample_batch_size: Optional[int] = field(
+        default=4,
+        metadata={"help": "Batch size (per device) for sampling images."}
+    )
+    tokenizer_max_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "The maximum length of the tokenizer. If not set, will default to the tokenizer's max length."}
+    )
     def to_dict(self):
         """
         Serializes this instance while replace `Enum` by their values and `GenerationConfig` by dictionaries (for JSON

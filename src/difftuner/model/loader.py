@@ -33,10 +33,10 @@ def load_scheduler_and_model_and_tokenizer(
     Support both training and inference.
     """
 
-    logger.info(f"{'-'*20} Loading scheduler, model and tokenizer {'-'*20}")
+    logger.info(f"Loading scheduler, model and tokenizer")
 
     noise_scheduler = DDPMScheduler.from_pretrained(model_args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.pretrained_model_name_or_path, subfolder="tokenizer", revision=model_args.revision
     )
 
@@ -44,7 +44,8 @@ def load_scheduler_and_model_and_tokenizer(
         model_args.pretrained_model_name_or_path, subfolder="unet", revision=model_args.non_ema_revision
     )
     controlnet = None
-    text_encoder = CLIPTextModel.from_pretrained(
+    text_encoder_cls = import_model_class_from_model_name_or_path(model_args.pretrained_model_name_or_path, model_args.revision)
+    text_encoder = text_encoder_cls.from_pretrained(
         model_args.pretrained_model_name_or_path, subfolder="text_encoder", revision=model_args.revision
     )
     vae = AutoencoderKL.from_pretrained(
@@ -83,8 +84,8 @@ def load_scheduler_and_model_and_tokenizer(
     
     elif finetuning_args.finetuning_type == "dreambooth":
         vae.requires_grad_(False)
-        text_encoder.requires_grad_(False)
-        unet.requires_grad_(False)
+        if not training_args.train_text_encoder:
+            text_encoder.requires_grad_(False)
         
         if training_args.gradient_checkpointing:
             unet.enable_gradient_checkpointing()
@@ -108,6 +109,7 @@ def load_scheduler_and_model_and_tokenizer(
             raise ValueError("xformers is not available. Make sure it is installed correctly")
     
 
+    logger.info(f"Finish loading scheduler, model and tokenizer")
     
     return noise_scheduler, unet, controlnet, vae, text_encoder, tokenizer
 

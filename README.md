@@ -18,6 +18,7 @@ pip install -r requirements.txt
 ```
 
 ### Train on a single GPU
+
 ```bash
-bash src/scripts/train_text_to_image_lora.sh
+bash scripts/train_text_to_image_lora.sh
 ```

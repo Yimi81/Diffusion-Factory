@@ -5,6 +5,7 @@ from difftuner.model import get_train_args
 from difftuner.train.full import run_full
 from difftuner.train.lora import run_lora, run_sdxl_lora
 from difftuner.train.controlnet import run_controlnet
+from difftuner.train.dreambooth import run_dreambooth
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
@@ -32,6 +33,8 @@ def run_exp(args: Optional[Dict[str, Any]] = None):
         run_full(model_args, data_args, training_args, finetuning_args, accelerator)
     elif finetuning_args.finetuning_type == "lora":
         run_lora(model_args, data_args, training_args, finetuning_args, accelerator)
+    elif finetuning_args.finetuning_type == "dreambooth":
+        run_dreambooth(model_args, data_args, training_args, finetuning_args, accelerator)
     elif finetuning_args.finetuning_type == "controlnet":
         run_controlnet(model_args, data_args, training_args, finetuning_args, accelerator)
     elif finetuning_args.finetuning_type == "sdxl-lora":
