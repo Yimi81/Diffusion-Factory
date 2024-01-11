@@ -22,3 +22,7 @@ pip install -r requirements.txt
 ```bash
 bash scripts/train_text_to_image_lora.sh
 ```
+
+### Contributors
+<!-- readme: collaborators,contributors -start -->
+<!-- readme: collaborators,contributors -end -->
