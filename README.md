@@ -25,4 +25,14 @@ bash scripts/train_text_to_image_lora.sh
 
 ### Contributors
 <!-- readme: collaborators,contributors -start -->
+<table>
+<tr>
+    <td align="center">
+        <a href="https://github.com/Yimi81">
+            <img src="https://avatars.githubusercontent.com/u/66633207?v=4" width="100;" alt="Yimi81"/>
+            <br />
+            <sub><b>YShow</b></sub>
+        </a>
+    </td></tr>
+</table>
 <!-- readme: collaborators,contributors -end -->
