@@ -24,5 +24,6 @@ bash scripts/train_text_to_image_lora.sh
 ```
 
 ### Contributors
-<!-- readme: collaborators,contributors -start -->
-<!-- readme: collaborators,contributors -end -->
+<a href="https://github.com/Yimi81/Diffusion-Factory/graphs/contributors">
+  <img  src="https://Yimi81.github.io/Diffusion-Factory/CONTRIBUTORS.svg" />
+</a>
